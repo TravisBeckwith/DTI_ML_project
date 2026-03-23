@@ -2,27 +2,27 @@
 
 **Last updated:** 2026-03-23  
 **Pipeline version:** v1.4-ml-enhanced  
-
-
----
-
-## Issue 1 — dcm2niix exports bvec with inverted y-axis
-
-**Status:** Fixed in pipeline (v1.4)  
-**Affected files:** Raw BIDS bvec (`sub-XXX_dwi.bvec`)  
-**Symptom:** Corpus callosum appears as an "n" shape instead of the correct "u" shape in the DEC/RGB-FA map, indicating the anterior-posterior gradient axis is inverted.  
-**Root cause:** dcm2niix exports the y-row of the gradient table with inverted polarity for this scanner/sequence. Confirmed by inspecting the raw bvec: the y-row (row 2) is almost entirely positive, which is physically implausible for a well-distributed gradient scheme. The x and z rows correctly contain a mixture of positive and negative values. MRtrix3's stride-based automatic gradient correction does not touch the y-axis in this case because the NIfTI y-stride is already positive (`-1 2 3 4`), so the error passes through uncorrected without an explicit fix.  
-**Fix applied:** An `awk` one-liner negates row 2 of the raw bvec immediately before the primary `mrconvert -fslgrad` import call. All downstream bvec exports derive from this corrected MIF, so the fix propagates automatically through the full pipeline without further changes.  
-**Note for external users:** The raw BIDS bvecs in this dataset have an inverted y-axis as exported by dcm2niix. Anyone running FSL, MRtrix3, or any other tool directly on the raw BIDS bvecs (outside this pipeline) must apply the same y-axis negation manually before tensor fitting.
+**Dataset:** CLS_125
 
 ---
 
-## Issue 2 — NIfTI x-stride causes non-deterministic gradient rotation at import
+## Issue 1 — -strides 1,2,3,4 flag introduced y-axis gradient flip
 
 **Status:** Fixed in pipeline (v1.4)  
-**Symptom:** Potential gradient axis misassignment depending on how dcm2niix stored the NIfTI (stride pattern `-1 2 3 4` confirmed for this dataset).  
-**Root cause:** `mrconvert -fslgrad` rotates FSL image-space bvecs into MRtrix3 scanner space using the NIfTI header strides. A negative x-stride means MRtrix3 must negate the x-gradient row. While MRtrix3 handles this correctly in most cases, the behaviour is sensitive to qform/sform integrity and can be non-deterministic across MRtrix3 versions.  
-**Fix applied:** `-strides 1,2,3,4` added to all `mrconvert -fslgrad` import calls. This reorients the voxel grid to all-positive strides before gradient embedding, making the vox-to-scanner rotation trivially identity on the sign components and eliminating the ambiguity entirely. Applied at four sites: raw import, VoxelMorph re-import, post-hoc refinement import, and ML refinement re-import.
+**Symptom:** Corpus callosum appeared as an "n" shape instead of the correct "u" shape in the DEC/RGB-FA map.  
+**Root cause:** Adding `-strides 1,2,3,4` to `mrconvert -fslgrad` calls was intended to canonicalise the voxel-to-scanner orientation. However, the raw NIfTI for this dataset has native strides of `-1 2 3 4` (x-axis negative). Forcing a reorientation to all-positive strides caused MRtrix3 to apply a compensatory transform to the embedded gradient directions that incorrectly negated the y-axis, introducing the "n" shape in the CC.  
+**Confirmed via:** dtifit run directly on the raw BIDS NIfTI and unmodified bvec produced a correct "u"-shaped CC, proving the raw bvec is correct and the pipeline was introducing the error.  
+**Fix applied:** All `-strides 1,2,3,4` flags removed from every `mrconvert -fslgrad` import site. Plain `-fslgrad` import used throughout, consistent with dtifit behaviour.  
+**Note:** The raw BIDS bvec for this dataset is correct as exported by dcm2niix. No gradient table correction is needed.
+
+---
+
+## Issue 2 — ~~dcm2niix bvec y-axis inversion~~ RETRACTED
+
+**Status:** Retracted — was an incorrect diagnosis  
+**Original hypothesis:** dcm2niix exported the bvec y-row with inverted polarity, evidenced by the y-row being almost entirely positive and a high asymmetry norm (0.559) from dirstat.  
+**Why it was wrong:** The asymmetry norm is a scalar magnitude and is identical before and after negating any axis — it cannot distinguish a flipped axis from a correctly oriented one. The high norm is a property of this particular 32-direction scheme being unipolar (directions distributed on one hemisphere by design, relying on diffusion symmetry). dtifit confirmed the raw bvec is correct.  
+**A y-flip awk command was briefly added to the pipeline and has been fully removed.**
 
 ---
 
@@ -47,7 +47,9 @@
 
 ## Verified correct
 
-- Mean FA within mask: 0.30 (expected range 0.25–0.50 for whole-brain masked mean)  
-- FA > 1 voxels: 0.1% of mask (benign boundary effect)  
-- NIfTI strides: `-1 2 3 4` (x negative, consistent with dcm2niix output for this scanner)  
+- Raw BIDS bvec: correct as exported by dcm2niix — confirmed via dtifit visual inspection
+- NIfTI strides: `-1 2 3 4` (x-axis negative; handled correctly by MRtrix3 native -fslgrad without stride forcing)
+- Mean FA within mask: 0.30 (expected range 0.25–0.50 for whole-brain masked mean)
+- FA > 1 voxels: 0.1% of mask (benign boundary effect)
 - TensorFlow duplicate CUDA factory registration warnings at startup: benign, caused by dual registration of cuDNN/cuBLAS plugins; does not affect computation
+- dirstat asymmetry norm of 0.559: expected for this unipolar 32-direction scheme; not indicative of a gradient error
