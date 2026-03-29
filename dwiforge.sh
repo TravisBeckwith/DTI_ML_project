@@ -67,9 +67,9 @@ set -euo pipefail
 #   ./dwiforge.sh -b /path/to/BIDS --storage-fast /path --storage-large /path
 # ============================================================================
 
-USER_BIDS_DIR="/mnt/c/study/BIDS"          # <-- EDIT: Path to your BIDS directory
-USER_STORAGE_FAST="/mnt/e/FAST"      # <-- EDIT: Fast SSD for pipeline outputs
-USER_STORAGE_LARGE="/mnt/f/LARGE"     # <-- EDIT: Large drive for FreeSurfer outputs
+USER_BIDS_DIR="/mnt/c/CLS/CLS_125/BIDS"          # <-- EDIT: Path to your BIDS directory
+USER_STORAGE_FAST="/mnt/e/CLS"      # <-- EDIT: Fast SSD for pipeline outputs
+USER_STORAGE_LARGE="/mnt/f/CLS"     # <-- EDIT: Large drive for FreeSurfer outputs
 
 # ============================================================================
 # END OF USER CONFIGURATION
@@ -2910,11 +2910,10 @@ run_basic_preprocessing() {
     
     # Convert DWI to MIF
     log "INFO" "[${sub}] Converting DWI to MIF format"
-    # Raw bvec confirmed correct via dtifit visual inspection (CC shows correct "u"
-    # shape with unmodified bvec).  The pipeline previously introduced a y-axis flip
-    # via -strides 1,2,3,4 forcing, which caused MRtrix3 to misapply its stride-based
-    # gradient rotation.  Using plain -fslgrad without stride forcing matches the
-    # behaviour of dtifit and produces correct tensor orientations.
+
+    # Import raw DWI with unmodified gradients.
+    # The y-axis correction is applied after eddy correction, immediately before
+    # dwi2tensor — see the comment at the tensor fitting step for full explanation.
     mrconvert "${BIDS_DIR}/${sub}/dwi/${sub}_dwi.nii.gz" dwi_raw.mif \
         -fslgrad "${BIDS_DIR}/${sub}/dwi/${sub}_dwi.bvec" "${BIDS_DIR}/${sub}/dwi/${sub}_dwi.bval" \
         -quiet -force || { log "ERROR" "[${sub}] mrconvert failed"; safe_cd_return; return 1; }
@@ -3124,29 +3123,60 @@ run_eddy_and_bias_correction() {
     
     # Compute DTI metrics
     log "INFO" "[${sub}] Computing DTI tensor and metrics"
-    dwi2tensor dwi_biascorr.mif tensor.mif -mask mask.mif -quiet -force || { 
-        log "ERROR" "[${sub}] dwi2tensor failed"; safe_cd_return; return 1; 
+
+    # dwi2tensor: compute scalar DTI metrics (FA, MD, AD, RD).
+    # No gradient correction needed here — these metrics are rotationally invariant
+    # and are not affected by axis sign errors.
+    dwi2tensor dwi_biascorr.mif tensor.mif \
+        -mask mask.mif -quiet -force || {
+        log "ERROR" "[${sub}] dwi2tensor failed"; safe_cd_return; return 1;
     }
-    
     tensor2metric tensor.mif \
         -fa fa.mif -adc md.mif -ad ad.mif -rd rd.mif \
-        -vector ev.mif -modulate fa \
-        -quiet -force || { 
-        log "ERROR" "[${sub}] tensor2metric failed"; safe_cd_return; return 1; 
+        -quiet -force || {
+        log "ERROR" "[${sub}] tensor2metric failed"; safe_cd_return; return 1;
     }
 
-    # Create a DEC (directionally-encoded colour) map for visualisation.
-    # ev.mif retains its original signed eigenvectors — sign is meaningful for
-    # downstream tools (tractography, etc.) and viewers like mrview apply abs()
-    # internally.  We take abs() only here, into a separate dec.mif, so that
-    # viewers that do NOT auto-abs (e.g. FSLeyes, ITK-SNAP) display correct colours
-    # without left-hemisphere x-components being clipped to black.
-    # IMPORTANT: do NOT apply abs() to ev.mif itself — that forces all x-components
-    # positive, making every CC fibre appear to lean right instead of being
-    # symmetric about the midline.
-    mrcalc ev.mif -abs dec.mif -force -quiet || {
-        log "WARN" "[${sub}] DEC map creation failed (non-fatal)"; true
+    # dtifit: compute eigenvector and DEC map.
+    # MRtrix eigenvectors are in scanner/RAS space. When exported to NIfTI with
+    # strides -1 2 3, the x-component sign is not adjusted for the negative
+    # x-stride, so FSLeyes reads the left-hemisphere x-component inverted —
+    # making both sides of the CC appear to lean the same direction.
+    # dtifit works entirely in FSL image space and handles this correctly.
+    # Confirmed: y-flip of the bvec + dtifit on the preprocessed NIfTI produces
+    # the correct "u"-shaped CC. All other axis combinations were tested and failed.
+    #
+    # The y-flip is applied here (post-eddy) not at raw import — eddy must see the
+    # original unmodified gradients for accurate per-volume motion estimation.
+    mrconvert dwi_biascorr.mif dwi_biascorr_ev.nii.gz -quiet -force || {
+        log "ERROR" "[${sub}] NIfTI export for eigenvector failed"; safe_cd_return; return 1;
     }
+    mrinfo dwi_biascorr.mif -export_grad_fsl ev_fit.bvec ev_fit.bval -quiet 2>/dev/null || {
+        log "ERROR" "[${sub}] gradient export for eigenvector failed"; safe_cd_return; return 1;
+    }
+    awk 'NR==2{for(i=1;i<=NF;i++) $i=-$i} 1' ev_fit.bvec > ev_fit_yflip.bvec
+    mrconvert mask.mif mask_ev.nii.gz -datatype uint8 -quiet -force
+    dtifit \
+        -k dwi_biascorr_ev.nii.gz \
+        -o dtifit_ev \
+        -m mask_ev.nii.gz \
+        -r ev_fit_yflip.bvec \
+        -b ev_fit.bval \
+        --wls --no_tensor || {
+        log "ERROR" "[${sub}] dtifit eigenvector failed"; safe_cd_return; return 1;
+    }
+    # Modulate V1 by FA to produce FA-weighted DEC map.
+    # FSLeyes handles vector sign internally when loaded as -ot rgb, so abs() is
+    # NOT applied — applying abs() before loading breaks left-hemisphere display.
+    # For viewers that genuinely require positive values, apply abs() manually.
+    fslmaths dtifit_ev_FA -mul dtifit_ev_V1 dtifit_ev_dec
+    mrconvert dtifit_ev_V1.nii.gz ev.mif -quiet -force
+    mrconvert dtifit_ev_dec.nii.gz dec.mif -quiet -force
+    rm -f dwi_biascorr_ev.nii.gz mask_ev.nii.gz ev_fit.bvec ev_fit.bval ev_fit_yflip.bvec \
+          dtifit_ev_FA.nii.gz dtifit_ev_V1.nii.gz dtifit_ev_dec.nii.gz \
+          dtifit_ev_L1.nii.gz dtifit_ev_L2.nii.gz dtifit_ev_L3.nii.gz \
+          dtifit_ev_V2.nii.gz dtifit_ev_V3.nii.gz dtifit_ev_MD.nii.gz \
+          dtifit_ev_MO.nii.gz dtifit_ev_S0.nii.gz
 
     update_progress "$sub" "preprocessing" 95
     
@@ -3164,10 +3194,11 @@ run_eddy_and_bias_correction() {
     
     mrconvert mask.mif "${outdir}/${sub}_mask.nii.gz" -datatype uint8 -quiet -force
     
-    # ev.nii.gz  — signed FA-modulated eigenvector; use for tractography and tools
+    # ev.nii.gz  — dtifit V1 (primary eigenvector); use for tractography and tools
     #              that expect real vector directions.
-    # dec.nii.gz — abs(ev), FA-modulated; load as RGB in FSLeyes/ITK-SNAP/mrview
-    #              for correct DEC visualisation without left-side clipping.
+    # dec.nii.gz — FA-modulated V1; load with -ot rgb in FSLeyes for correct DEC
+    #              visualisation. FSLeyes handles vector sign internally — do NOT
+    #              apply abs() before loading or left-hemisphere display breaks.
     for metric in fa md ad rd ev; do 
         mrconvert "${metric}.mif" "${outdir}/${sub}_${metric}.nii.gz" -quiet -force
     done
