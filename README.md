@@ -1,5 +1,6 @@
 # dwiforge
 ### `dwiforge.sh` — v1.4
+10.5281/zenodo.19740323
 
 A comprehensive, single-script Bash pipeline for diffusion tensor imaging (DTI) processing, structural connectivity analysis, and microstructure modeling. Designed for BIDS-formatted datasets on Linux/WSL2 with support for multi-drive storage layouts.
 
