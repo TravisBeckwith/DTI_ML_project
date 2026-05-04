@@ -1,6 +1,6 @@
 # DWIForge v2
 
-A modular, checkpoint-based diffusion MRI preprocessing and analysis pipeline for single-shell and multi-shell acquisitions. Designed for Philips scanners but applicable to any BIDS-compliant dataset.
+A modular, checkpoint-based diffusion MRI preprocessing and analysis pipeline for single-shell and multi-shell acquisitions. Designed for any BIDS-compliant dataset.
 
 ## Pipeline Stages
 
